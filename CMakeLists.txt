@@ -30,6 +30,13 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(decodeless_offset_ptr)
 
 FetchContent_Declare(
+    decodeless_mappedfile
+    GIT_REPOSITORY https://github.com/decodeless/mappedfile.git
+    GIT_TAG 6550dc283b3a01de1c0d02c79bfd6422812d70e8
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(decodeless_mappedfile)
+
+FetchContent_Declare(
     decodeless_writer
     GIT_REPOSITORY https://github.com/decodeless/writer.git
     GIT_TAG 2afa7104b986e52031b0969f30512d7995623a84

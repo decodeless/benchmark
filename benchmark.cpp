@@ -14,7 +14,9 @@
 #include <stdio.h>
 
 #ifdef _WIN32
-#include <windows.h>
+    #include <memoryapi.h>
+    #include <sysinfoapi.h>
+    #include <windows.h>
 #endif
 
 #define MB_PER_RUN 256
@@ -48,7 +50,7 @@ void check(bool result, const char* text) {
         throw std::runtime_error("failed '" + std::string(text) + "'");
 }
 
-TEST(Benchmark, WriteSequentialInts) {
+TEST(WriteFile, SequentialInts) {
     constexpr int32_t numIntsToWrite = MB_PER_RUN * 1024 * 1024 / sizeof(int32_t);
     const TmpFile     resultFwrite("result_fwrite.dat");
     const TmpFile     resultOfstream("result_ofstream.dat");
@@ -56,7 +58,7 @@ TEST(Benchmark, WriteSequentialInts) {
     const TmpFile     resultWriter("result_writer.dat");
 
 #ifndef _WIN32
-    bool              driveIsRotational =
+    bool driveIsRotational =
         system(("test 1 = $(lsblk -o ROTA $(df --output=source " +
                 resultFwrite.path.parent_path().string() + " | tail -1) | tail -1)")
                    .c_str()) == 0;
@@ -104,8 +106,8 @@ TEST(Benchmark, WriteSequentialInts) {
                                             FILE_ATTRIBUTE_NORMAL, nullptr);
                  CHECK(hFile != INVALID_HANDLE_VALUE);
 
-                 size_t elements = numIntsToWrite;
-                 size_t size = sizeof(int32_t) * elements;
+                 size_t        elements = numIntsToWrite;
+                 size_t        size = sizeof(int32_t) * elements;
                  LARGE_INTEGER liSize;
                  liSize.QuadPart = size;
                  CHECK(SetFilePointerEx(hFile, liSize, nullptr, FILE_BEGIN));
@@ -165,7 +167,7 @@ TEST(Benchmark, WriteSequentialInts) {
     EXPECT_EQ(memcmp(resultFwriteFile.data(), resultWriterFile.data(), resultWriterFile.size()), 0);
 }
 
-TEST(Benchmark, WriteSequentialBlocks) {
+TEST(WriteFile, SequentialBlocks) {
     constexpr int32_t numIntsPerBlock = 10000;
     constexpr int32_t numIntsToWrite = MB_PER_RUN * 1024 * 1024 / sizeof(int32_t);
     constexpr int32_t numBlocksToWrite = numIntsToWrite / numIntsPerBlock;
@@ -210,7 +212,7 @@ TEST(Benchmark, WriteSequentialBlocks) {
                  }
                  f.flush();
 #ifdef _WIN32
-        // ??
+                 // ??
 #else
                  sync();
 #endif
@@ -306,4 +308,146 @@ TEST(Benchmark, WriteSequentialBlocks) {
     EXPECT_EQ(
         memcmp(resultFwriteFile.data(), resultWriterFillFile.data(), resultWriterFillFile.size()),
         0);
+}
+
+TEST(WriteMemory, SequentialInts) {
+    constexpr size_t  reservedAddressSpace = 1024 * 1024 * 1024;
+    constexpr int32_t numIntsToWrite = MB_PER_RUN * 1024 * 1024 / sizeof(int32_t);
+    constexpr size_t  bytesToWrite = numIntsToWrite * sizeof(int32_t);
+    static_assert(bytesToWrite <= reservedAddressSpace);
+    printf("Writing %zu bytes\n", bytesToWrite);
+    nb::Bench()
+        .minEpochTime(std::chrono::milliseconds(50))
+        .maxEpochTime(std::chrono::seconds(3))
+        .minEpochIterations(3)
+        //.warmup(1)
+        .relative(true)
+#ifdef _WIN32
+        .run("VirtualAlloc",
+             [&] {
+                 size_t pageSize = []() {
+                     SYSTEM_INFO info;
+                     GetSystemInfo(&info);
+                     return info.dwPageSize;
+                 }();
+                 uint32_t* memory =
+                     (uint32_t*)VirtualAlloc(0, reservedAddressSpace, MEM_RESERVE, PAGE_NOACCESS);
+                 size_t end = 0;
+                 for (size_t i = 0; i < numIntsToWrite; ++i) {
+                     if (i * sizeof(int32_t) >= end) {
+                         size_t allocSize =
+                             std::max(end, pageSize); // match writer's exponential increase
+                         assert(allocSize % pageSize == 0);
+                         std::ignore = VirtualAlloc(((std::byte*)memory) + end, allocSize,
+                                                    MEM_COMMIT, PAGE_READWRITE);
+                         end += allocSize;
+                     }
+                     memory[i] = int32_t(i);
+                 }
+                 ankerl::nanobench::doNotOptimizeAway(memory);
+                 CHECK(VirtualFree(memory, 0, MEM_RELEASE));
+             })
+#else
+        .run("mmap",
+             [&] {
+                 size_t pageSize = sysconf(_SC_PAGESIZE);
+                 uint32_t* memory =
+                     (uint32_t*)mmap(nullptr, reservedAddressSpace, PROT_NONE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                 CHECK(memory != MAP_FAILED);
+                 size_t end = 0;
+                 for (size_t i = 0; i < numIntsToWrite; ++i) {
+                     if (i * sizeof(int32_t) >= end) {
+                         size_t allocSize =
+                             std::max(end, pageSize); // match writer's exponential increase
+                         assert(allocSize % pageSize == 0);
+                         CHECK(mprotect((std::byte*)memory + end, allocSize,
+                                        PROT_READ | PROT_WRITE) == 0);
+                         end += allocSize;
+                     }
+                     memory[i] = int32_t(i);
+                 }
+                 ankerl::nanobench::doNotOptimizeAway(memory);
+                 CHECK(munmap(memory, reservedAddressSpace) == 0);
+             })
+#endif
+        .run("writer", [&] {
+            decodeless::memory_writer f(reservedAddressSpace, 4);
+            for (int32_t i = 0; i < numIntsToWrite; ++i)
+                f.create<int32_t>(i);
+        });
+}
+
+TEST(WriteMemory, SequentialBlocks) {
+    constexpr size_t  reservedAddressSpace = 1024 * 1024 * 1024;
+    constexpr int32_t numIntsPerBlock = 10000;
+    constexpr int32_t numIntsToWrite = MB_PER_RUN * 1024 * 1024 / sizeof(int32_t);
+    constexpr int32_t numBlocksToWrite = numIntsToWrite / numIntsPerBlock;
+    static_assert(numBlocksToWrite > 10);
+    constexpr size_t bytesToWrite = numBlocksToWrite * numIntsPerBlock * sizeof(int32_t);
+    static_assert(bytesToWrite <= reservedAddressSpace);
+    printf("Writing %zu bytes in %i blocks of %zu bytes\n", bytesToWrite, numBlocksToWrite,
+           numIntsPerBlock * sizeof(int32_t));
+    nb::Bench()
+        .minEpochTime(std::chrono::milliseconds(50))
+        .maxEpochTime(std::chrono::seconds(3))
+        .minEpochIterations(3)
+        //.warmup(1)
+        .relative(true)
+#ifdef _WIN32
+        .run("VirtualAlloc",
+             [&] {
+                 size_t pageSize = []() {
+                     SYSTEM_INFO info;
+                     GetSystemInfo(&info);
+                     return info.dwPageSize;
+                 }();
+                 uint32_t* memory =
+                     (uint32_t*)VirtualAlloc(0, reservedAddressSpace, MEM_RESERVE, PAGE_NOACCESS);
+                 size_t allocPages = (numIntsPerBlock * sizeof(int32_t) + pageSize - 1) / pageSize;
+                 size_t end = 0;
+                 for (int32_t i = 0; i < numBlocksToWrite; ++i) {
+                     if ((i + 1) * numIntsPerBlock * sizeof(int32_t) > end) {
+                         size_t allocSize = std::max(
+                             end, allocPages * pageSize); // match writer's exponential increase
+                         assert(allocSize % pageSize == 0);
+                         std::ignore = VirtualAlloc(((std::byte*)memory) + end, allocSize,
+                                                    MEM_COMMIT, PAGE_READWRITE);
+                         end += allocSize;
+                     }
+                     std::ranges::fill(std::span(memory + i * numIntsPerBlock, numIntsPerBlock), i);
+                 }
+                 ankerl::nanobench::doNotOptimizeAway(memory);
+                 CHECK(VirtualFree(memory, 0, MEM_RELEASE));
+             })
+#else
+        .run("mmap",
+             [&] {
+                 size_t pageSize = sysconf(_SC_PAGESIZE);
+                 uint32_t* memory =
+                     (uint32_t*)mmap(nullptr, reservedAddressSpace, PROT_NONE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                 CHECK(memory != MAP_FAILED);
+                 size_t allocPages = (numIntsPerBlock * sizeof(int32_t) + pageSize - 1) / pageSize;
+                 size_t end = 0;
+                 for (int32_t i = 0; i < numBlocksToWrite; ++i) {
+                     if ((i + 1) * numIntsPerBlock * sizeof(int32_t) > end) {
+                         size_t allocSize = std::max(
+                             end, allocPages * pageSize); // match writer's exponential increase
+                         assert(allocSize % pageSize == 0);
+                         CHECK(mprotect((std::byte*)memory + end, allocSize,
+                                        PROT_READ | PROT_WRITE) == 0);
+                         end += allocSize;
+                     }
+                     std::ranges::fill(std::span(memory + i * numIntsPerBlock, numIntsPerBlock), i);
+                 }
+                 ankerl::nanobench::doNotOptimizeAway(memory);
+                 CHECK(munmap(memory, reservedAddressSpace) == 0);
+             })
+#endif
+        .run("std::ranges::fill(writer::createArray())", [&] {
+            decodeless::memory_writer f(reservedAddressSpace, 4);
+            for (int32_t i = 0; i < numBlocksToWrite; ++i)
+                std::ranges::fill(f.createArray<int32_t>(numIntsPerBlock), i);
+        });
 }
