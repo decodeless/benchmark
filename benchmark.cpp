@@ -1,5 +1,7 @@
 // Copyright (c) 2024 Pyarelal Knowles, MIT License
 
+#define _CRT_SECURE_NO_DEPRECATE
+
 // #define ANKERL_NANOBENCH_IMPLEMENT
 #include <decodeless/offset_ptr.hpp>
 #include <decodeless/writer.hpp>
@@ -11,12 +13,24 @@
 #include <stdexcept>
 #include <stdio.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #define MB_PER_RUN 256
 
 namespace nb = ankerl::nanobench;
 namespace fs = std::filesystem;
 
-fs::path exePath() { return std::filesystem::canonical("/proc/self/exe"); }
+fs::path exePath() {
+#ifdef _WIN32
+    wchar_t path[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    return path;
+#else
+    return std::filesystem::canonical("/proc/self/exe");
+#endif
+}
 
 struct TmpFile {
     TmpFile(std::string_view filename)
@@ -40,11 +54,15 @@ TEST(Benchmark, WriteSequentialInts) {
     const TmpFile     resultOfstream("result_ofstream.dat");
     const TmpFile     resultMmap("result_mmap.dat");
     const TmpFile     resultWriter("result_writer.dat");
+
+#ifndef _WIN32
     bool              driveIsRotational =
         system(("test 1 = $(lsblk -o ROTA $(df --output=source " +
                 resultFwrite.path.parent_path().string() + " | tail -1) | tail -1)")
                    .c_str()) == 0;
     printf("Drive: %s\n", driveIsRotational ? "rotational" : "not rotational");
+#endif
+
     printf("Writing %zu bytes\n", numIntsToWrite * sizeof(int32_t));
     nb::Bench()
         //.minEpochTime(std::chrono::milliseconds(50))
@@ -58,8 +76,13 @@ TEST(Benchmark, WriteSequentialInts) {
                  for (int32_t i = 0; i < numIntsToWrite; ++i)
                      fwrite(&i, sizeof(i), 1, f);
                  fflush(f);
+#ifdef _WIN32
+                 FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));
+                 fclose(f);
+#else
                  fclose(f);
                  sync();
+#endif
              })
         .run("ofstream",
              [&] {
@@ -67,8 +90,43 @@ TEST(Benchmark, WriteSequentialInts) {
                  for (int32_t i = 0; i < numIntsToWrite; ++i)
                      f.write(reinterpret_cast<const char*>(&i), sizeof(i));
                  f.flush();
+#ifdef _WIN32
+                 // ??
+#else
                  sync();
+#endif
              })
+#ifdef _WIN32
+        .run("MapViewOfFile",
+             [&] {
+                 HANDLE hFile = CreateFileW(resultMmap.path.generic_wstring().c_str(),
+                                            GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                            FILE_ATTRIBUTE_NORMAL, nullptr);
+                 CHECK(hFile != INVALID_HANDLE_VALUE);
+
+                 size_t elements = numIntsToWrite;
+                 size_t size = sizeof(int32_t) * elements;
+                 LARGE_INTEGER liSize;
+                 liSize.QuadPart = size;
+                 CHECK(SetFilePointerEx(hFile, liSize, nullptr, FILE_BEGIN));
+                 CHECK(SetEndOfFile(hFile));
+
+                 HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+                 CHECK(hMap != nullptr);
+
+                 auto mapped = (int32_t*)MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, size);
+                 CHECK(mapped != nullptr);
+
+                 for (size_t i = 0; i < elements; ++i)
+                     mapped[i] = int32_t(i);
+
+                 CHECK(FlushViewOfFile(mapped, size));
+                 CHECK(FlushFileBuffers(hFile));
+                 CHECK(UnmapViewOfFile(mapped));
+                 CloseHandle(hMap);
+                 CloseHandle(hFile);
+             })
+#else
         .run("mmap",
              [&] {
                  int    f = open(resultMmap.path.c_str(), O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
@@ -78,16 +136,21 @@ TEST(Benchmark, WriteSequentialInts) {
                  auto mapped = (int32_t*)mmap(0, size, PROT_WRITE, MAP_SHARED, f, 0);
                  CHECK(mapped != nullptr);
                  for (size_t i = 0; i < elements; ++i)
-                     mapped[i] = i;
+                     mapped[i] = int32_t(i);
                  CHECK(fsync(f) == 0);
                  CHECK(munmap(mapped, size) == 0);
                  sync();
              })
+#endif
         .run("writer", [&] {
             decodeless::file_writer f(resultWriter.path, 1024 * 1024 * 1024, 4);
             for (int32_t i = 0; i < numIntsToWrite; ++i)
                 f.create<int32_t>(i);
+#ifdef _WIN32
+            // ??
+#else
             sync();
+#endif
         });
     decodeless::file resultFwriteFile(resultFwrite.path);
     decodeless::file resultOfstreamFile(resultOfstream.path);
@@ -129,8 +192,13 @@ TEST(Benchmark, WriteSequentialBlocks) {
                      fwrite(bulk.data(), sizeof(*bulk.data()), bulk.size(), f);
                  }
                  fflush(f);
+#ifdef _WIN32
+                 FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));
+                 fclose(f);
+#else
                  fclose(f);
                  sync();
+#endif
              })
         .run("ofstream",
              [&] {
@@ -141,8 +209,45 @@ TEST(Benchmark, WriteSequentialBlocks) {
                              sizeof(*bulk.data()) * bulk.size());
                  }
                  f.flush();
+#ifdef _WIN32
+        // ??
+#else
                  sync();
+#endif
              })
+#ifdef _WIN32
+        .run("MapViewOfFile",
+             [&] {
+                 HANDLE hFile = CreateFileW(resultMmap.path.generic_wstring().c_str(),
+                                            GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                            FILE_ATTRIBUTE_NORMAL, nullptr);
+                 CHECK(hFile != INVALID_HANDLE_VALUE);
+
+                 size_t        elements = numBlocksToWrite * numIntsPerBlock;
+                 size_t        size = sizeof(int32_t) * elements;
+                 LARGE_INTEGER liSize;
+                 liSize.QuadPart = size;
+                 CHECK(SetFilePointerEx(hFile, liSize, nullptr, FILE_BEGIN));
+                 CHECK(SetEndOfFile(hFile));
+
+                 HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+                 CHECK(hMap != nullptr);
+
+                 auto mapped = (int32_t*)MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, size);
+                 CHECK(mapped != nullptr);
+
+                 for (int32_t i = 0; i < (int32_t)(elements / numIntsPerBlock); ++i)
+                     std::ranges::fill(
+                         std::span(mapped, elements).subspan(i * numIntsPerBlock, numIntsPerBlock),
+                         i);
+
+                 CHECK(FlushViewOfFile(mapped, size));
+                 CHECK(FlushFileBuffers(hFile));
+                 CHECK(UnmapViewOfFile(mapped));
+                 CloseHandle(hMap);
+                 CloseHandle(hFile);
+             })
+#else
         .run("mmap",
              [&] {
                  int    f = open(resultMmap.path.c_str(), O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
@@ -159,6 +264,7 @@ TEST(Benchmark, WriteSequentialBlocks) {
                  CHECK(munmap(mapped, size) == 0);
                  sync();
              })
+#endif
         .run("writer::createArray(copy)",
              [&] {
                  decodeless::file_writer f(resultWriterCopy.path, 1024 * 1024 * 1024, 4);
@@ -166,13 +272,21 @@ TEST(Benchmark, WriteSequentialBlocks) {
                      std::vector<int32_t> bulk(numIntsPerBlock, i);
                      f.createArray<int32_t>(bulk);
                  }
+#ifdef _WIN32
+                 // ??
+#else
                  sync();
+#endif
              })
         .run("std::ranges::fill(writer::createArray())", [&] {
             decodeless::file_writer f(resultWriterFill.path, 1024 * 1024 * 1024, 4);
             for (int32_t i = 0; i < numBlocksToWrite; ++i)
                 std::ranges::fill(f.createArray<int32_t>(numIntsPerBlock), i);
+#ifdef _WIN32
+            // ??
+#else
             sync();
+#endif
         });
     decodeless::file resultFwriteFile(resultFwrite.path);
     decodeless::file resultOfstreamFile(resultOfstream.path);
