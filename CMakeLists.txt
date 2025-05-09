@@ -25,14 +25,21 @@ FetchContent_MakeAvailable(nanobench)
 FetchContent_Declare(
     decodeless_offset_ptr
     GIT_REPOSITORY https://github.com/decodeless/offset_ptr.git
-    GIT_TAG 1f87a9d7a8be23b90c06124014f286df91562006
+    GIT_TAG 38ceefc6ce63fb4667cd207424b1277c3eed5f8d
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(decodeless_offset_ptr)
 
 FetchContent_Declare(
+    decodeless_mappedfile
+    GIT_REPOSITORY https://github.com/decodeless/mappedfile.git
+    GIT_TAG 6550dc283b3a01de1c0d02c79bfd6422812d70e8
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(decodeless_mappedfile)
+
+FetchContent_Declare(
     decodeless_writer
     GIT_REPOSITORY https://github.com/decodeless/writer.git
-    GIT_TAG af57ca839694a7f3ca70afdfb8bab3420ad833cf
+    GIT_TAG 2afa7104b986e52031b0969f30512d7995623a84
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(decodeless_writer)
 
